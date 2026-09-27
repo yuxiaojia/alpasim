@@ -18,6 +18,7 @@ from alpasim_grpc.v0.egodriver_pb2 import Route
 from alpasim_utils.geometry import Pose, Trajectory
 from scipy.interpolate import interp1d
 
+from ..fault_injection import inference_window
 from ..schema import ModelConfig
 from .base import (
     BaseTrajectoryModel,
@@ -694,7 +695,12 @@ class AlpamayoBaseModel(BaseTrajectoryModel):
         # Run inference with autocast
         with torch.no_grad():
             with torch.autocast(str(self._device.type), dtype=self.DTYPE):
-                pred_xyz, pred_rot, extra = self._run_inference(model_inputs, nav_text)
+                with inference_window(
+                    prediction_input.inference_seed, latest_timestamp, self._device
+                ) as fault_record:
+                    pred_xyz, pred_rot, extra = self._run_inference(
+                        model_inputs, nav_text
+                    )
 
         # Sampled candidates in the rig frame at t0, shapes
         # [batch=1, num_traj_sets=1, K, T, ...] -> (K, T, ...).
@@ -715,6 +721,10 @@ class AlpamayoBaseModel(BaseTrajectoryModel):
         )
         selected_positions = candidate_positions[select_ix]  # (T, 3)
         selected_rotations = candidate_rotations[select_ix]  # (T, 3, 3)
+        if fault_record is not None:
+            fault_record.save_prediction(
+                candidate_positions, candidate_rotations, select_ix
+            )
 
         # Log the reasoning trace of the selected candidate if available.  Text
         # outputs have shape [batch, num_traj_sets, K] like the trajectories.

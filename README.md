@@ -80,6 +80,7 @@ For cluster or SLURM deployment, see `src/tools/run-on-slurm`.
 - **[Onboarding Guide](docs/ONBOARDING.md)**: Initial setup and access instructions
 - **[Tutorial](docs/TUTORIAL.md)**: Step-by-step usage guide
 - **[Manual Driver](docs/MANUAL_DRIVER.md)**: Interactive keyboard control of the ego vehicle
+- **[Fault Injection](docs/FAULT_INJECTION.md)**: TensorDynamic single-bit experiments in Alpamayo inference
 - **[Video Model Renderer](docs/VIDEO_MODEL.md)**: Running OmniDreams through FlashDreams as the
   AlpaSim renderer backend
 - **[Operations Guide](docs/OPERATIONS.md)**: Performance tuning, configuration, and troubleshooting

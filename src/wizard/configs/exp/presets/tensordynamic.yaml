@@ -1,0 +1,72 @@
+# @package _global_
+# Use with driver=alpamayo1 or driver=alpamayo1_5 and topology=1gpu.
+defines:
+  tensordynamic_root: ${oc.env:TENSORDYNAMIC_ROOT}
+  fi_mode: clean
+  fi_preload: ""
+  fi_step: 1
+  fi_kernel: 1
+  fi_instruction: 1
+  fi_block: 0
+  fi_thread: 0
+  fi_bit: 31
+  fi_seed: 42
+
+wizard:
+  timeout: 3600
+  nr_retries: 0
+
+driver:
+  model:
+    force_determinism: true
+    num_trajectory_samples: 1
+  inference:
+    max_batch_size: 1
+
+runtime:
+  nr_workers: 1
+  max_rollout_retries: 0
+  enable_autoresume: false
+  simulation_config:
+    n_rollouts: 1
+  endpoints:
+    driver:
+      n_concurrent_rollouts: 1
+    renderer:
+      n_concurrent_rollouts: 1
+    physics:
+      n_concurrent_rollouts: 1
+    controller:
+      n_concurrent_rollouts: 1
+    trafficsim:
+      n_concurrent_rollouts: 1
+
+services:
+  driver:
+    replicas_per_container: 1
+    volumes:
+      - "${defines.drivers}:/mnt/drivers"
+      - "${wizard.log_dir}:/mnt/output"
+      - "${repo-relative:'src'}:/repo/src"
+      - "${repo-relative:'plugins'}:/repo/plugins"
+      - "${defines.hf_cache}:/root/.cache/huggingface"
+      - "${defines.tensordynamic_root}:/mnt/tensordynamic:ro"
+    environments:
+      - "ALPASIM_FI_MODE=${defines.fi_mode}"
+      - "ALPASIM_FI_OUTPUT=/mnt/output/fault-injection"
+      - "ALPASIM_FI_SEED=${defines.fi_seed}"
+      - "TD_MODE=${defines.fi_mode}"
+      - "TD_LOG_PATH=/mnt/output/faults.jsonl"
+      - "TD_TARGET_INFERENCE=${defines.fi_step}"
+      - "TD_TARGET_KERNEL=${defines.fi_kernel}"
+      - "TD_TARGET_INSTRUCTION=${defines.fi_instruction}"
+      - "TD_TARGET_BLOCK=${defines.fi_block}"
+      - "TD_TARGET_THREAD=${defines.fi_thread}"
+      - "TD_BIT=${defines.fi_bit}"
+    # Apply LD_PRELOAD only to Python; preloading uv/shell would open the log twice.
+    command:
+      - "uv run env LD_PRELOAD=${defines.fi_preload} python -m alpasim_driver.main"
+      - "--config-path=/mnt/output"
+      - "--config-name=driver-config.yaml"
+      - "host=0.0.0.0"
+      - "port={port}"

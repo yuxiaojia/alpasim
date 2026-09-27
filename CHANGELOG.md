@@ -2,6 +2,13 @@
 This document lists major updates which change UX and require adaptation.
 It should be sorted by date (more recent on top) and link to MRs which introduce the changes.
 
+## TensorDynamic fault injection (27.09.26, `alpasim_injector` branch)
+
+Opt-in `alpasim_driver.fault_injection` hook around the Alpamayo 1/1.5 model call,
+and the `+exp/presets=tensordynamic` wizard preset. Modes: `clean`, `observe`,
+`bitflip` and `profile`. The hook has no effect unless `ALPASIM_FI_MODE` is set. See
+[docs/FAULT_INJECTION.md](docs/FAULT_INJECTION.md).
+
 ## August 2026 public sync updates (11.08.26)
 
 This release adds Alpamayo 2 support, improves Alpamayo image processing, and
