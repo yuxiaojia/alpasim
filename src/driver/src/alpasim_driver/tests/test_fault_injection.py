@@ -50,6 +50,24 @@ class FaultInjectionTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             record.save_prediction(positions, positions, 0)
 
+    def test_trace_records_nonfinite_module_outputs_for_selected_inference(self):
+        self.configure("clean")
+        os.environ["ALPASIM_FI_TRACE"] = "2"
+        model = fi.torch.nn.Sequential(fi.torch.nn.Identity(), fi.torch.nn.ReLU())
+        for _ in range(2):
+            with fi.inference_window(7, 100, "cpu", model):
+                model(fi.torch.tensor([1.0, float("nan"), -2.0]))
+        self.assertFalse((self.directory / "trace-000001.jsonl").exists())
+        lines = [
+            json.loads(line)
+            for line in (self.directory / "trace-000002.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual([x["module"] for x in lines[:-1]], ["0", "1", "<root>"])
+        self.assertEqual(lines[0]["nonfinite"], 1)
+        self.assertEqual(lines[0]["finite_max_abs"], 2.0)
+        self.assertEqual(lines[-1], {"total_module_calls": 3})
+        self.assertEqual(model._forward_hooks, {})
+
     def test_missing_preload_fails_before_model_runs(self):
         self.configure("bitflip")
         os.environ["TD_MODE"] = "bitflip"

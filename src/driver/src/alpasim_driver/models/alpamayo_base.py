@@ -696,7 +696,10 @@ class AlpamayoBaseModel(BaseTrajectoryModel):
         with torch.no_grad():
             with torch.autocast(str(self._device.type), dtype=self.DTYPE):
                 with inference_window(
-                    prediction_input.inference_seed, latest_timestamp, self._device
+                    prediction_input.inference_seed,
+                    latest_timestamp,
+                    self._device,
+                    self._model,
                 ) as fault_record:
                     pred_xyz, pred_rot, extra = self._run_inference(
                         model_inputs, nav_text

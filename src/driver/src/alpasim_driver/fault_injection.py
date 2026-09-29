@@ -6,6 +6,8 @@
 Set ALPASIM_FI_MODE=clean|observe|bitflip and ALPASIM_FI_OUTPUT to a fresh
 directory. Observe/bitflip require the TensorDynamic alpasim_injector preloaded.
 Inference numbers are process-wide and one-based; use one driver and one rollout.
+ALPASIM_FI_TRACE=8 (or 8,87) additionally records, for those inferences, every
+module output of the model that contains inf/NaN, in call order (trace-*.jsonl).
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import json
 import os
 import threading
 import time
+import contextlib
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,7 +46,58 @@ class InferenceRecord:
 
 
 @contextmanager
-def inference_window(seed: int, model_t0_us: int, device):
+def _nonfinite_trace(model, path: Path):
+    """Log module outputs containing inf/NaN, in call order, flushed per line.
+
+    Each check synchronizes, so this is only for diagnosing a chosen inference;
+    lines are written before a later device-side assert can abort the process.
+    """
+    calls = 0
+    handles = []
+    with path.open("x") as log:
+
+        def hook(module, _inputs, output):
+            nonlocal calls
+            calls += 1
+            tensors = output if isinstance(output, (tuple, list)) else (output,)
+            for index, tensor in enumerate(tensors):
+                if not torch.is_tensor(tensor) or not tensor.is_floating_point():
+                    continue
+                bad = int((~torch.isfinite(tensor)).sum())
+                if bad:
+                    finite = tensor[torch.isfinite(tensor)]
+                    log.write(
+                        json.dumps(
+                            dict(
+                                call=calls,
+                                module=module._trace_name,
+                                output=index,
+                                shape=list(tensor.shape),
+                                nonfinite=bad,
+                                finite_max_abs=(
+                                    float(finite.abs().max())
+                                    if finite.numel()
+                                    else None
+                                ),
+                            )
+                        )
+                        + "\n"
+                    )
+                    log.flush()
+
+        for name, module in model.named_modules():
+            module._trace_name = name or "<root>"
+            handles.append(module.register_forward_hook(hook))
+        try:
+            yield
+        finally:
+            for handle in handles:
+                handle.remove()
+            log.write(json.dumps(dict(total_module_calls=calls)) + "\n")
+
+
+@contextmanager
+def inference_window(seed: int, model_t0_us: int, device, model=None):
     """Synchronize and bracket only the model call, excluding model loading.
 
     Disabled unless explicitly configured. The clean run has the same recording
@@ -108,8 +162,17 @@ def inference_window(seed: int, model_t0_us: int, device):
             if tool is not None and tool.td_begin_inference(step) != 0:
                 raise RuntimeError("TensorDynamic refused the inference window")
             start = time.perf_counter()
+            traced = {
+                int(x) for x in os.environ.get("ALPASIM_FI_TRACE", "").split(",") if x
+            }
+            trace = (
+                _nonfinite_trace(model, directory / f"trace-{step:06d}.jsonl")
+                if model is not None and step in traced
+                else contextlib.nullcontext()
+            )
             try:
-                yield record
+                with trace:
+                    yield record
                 torch.cuda.synchronize(device)
                 if tool is not None:
                     reached = tool.td_end_inference()
