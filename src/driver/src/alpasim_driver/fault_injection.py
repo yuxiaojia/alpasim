@@ -55,8 +55,10 @@ def inference_window(seed: int, model_t0_us: int, device):
     if mode is None:
         yield None
         return
-    if mode not in {"clean", "observe", "bitflip", "profile"}:
-        raise ValueError("ALPASIM_FI_MODE must be clean, observe, bitflip, or profile")
+    if mode not in {"clean", "observe", "bitflip", "profile", "values"}:
+        raise ValueError(
+            "ALPASIM_FI_MODE must be clean, observe, bitflip, profile, or values"
+        )
     if not _lock.acquire(blocking=False):
         raise RuntimeError("Fault injection requires serial inference")
     try:
