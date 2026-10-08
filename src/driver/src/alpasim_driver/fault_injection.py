@@ -8,6 +8,11 @@ directory. Observe/bitflip require the TensorDynamic alpasim_injector preloaded.
 Inference numbers are process-wide and one-based; use one driver and one rollout.
 ALPASIM_FI_TRACE=8 (or 8,87) additionally records, for those inferences, every
 module output of the model that contains inf/NaN, in call order (trace-*.jsonl).
+ALPASIM_FI_MODE=operands needs alpasim_operands.so preloaded. ALPASIM_FI_MODE=layers
+needs no tool: for the inferences in ALPASIM_FI_LAYER_STEPS (e.g. 1,15,30) it records,
+per nn.Linear and output channel, how many outputs have |y| > 2, the per-channel max |y|,
+the 16 largest |y| with their position, and once per run the weight statistics per
+output channel (layers-*.npz, layer-weights.npz).
 """
 
 from __future__ import annotations
@@ -97,6 +102,77 @@ def _nonfinite_trace(model, path: Path):
 
 
 @contextmanager
+def _layer_profile(model, directory: Path, step: int):
+    """Per nn.Linear output statistics for one inference, reduced on the GPU."""
+    linears = [(n, m) for n, m in model.named_modules() if isinstance(m, torch.nn.Linear)]
+    weights = directory / "layer-weights.npz"
+    if not weights.exists():
+        out = {}
+        for i, (_name, m) in enumerate(linears):
+            w = m.weight.detach().float()
+            out[f"l2_{i}"] = w.norm(dim=1).cpu().numpy()
+            out[f"l1_{i}"] = w.abs().sum(dim=1).cpu().numpy()
+            out[f"max_{i}"] = w.abs().amax(dim=1).cpu().numpy()
+        np.savez(weights, names=np.array([n for n, _ in linears]), **out)
+    stats = {}
+    handles = []
+
+    def make_hook(i):
+        def hook(_module, inputs, output):
+            if not torch.is_tensor(output) or not output.is_floating_point():
+                return
+            y = output.detach().float().reshape(-1, output.shape[-1]).abs()
+            finite = torch.isfinite(y)
+            y = torch.where(finite, y, torch.zeros_like(y))
+            s = stats.get(i)
+            if s is None:
+                s = stats[i] = dict(
+                    rows=0, calls=0,
+                    gt2=torch.zeros(y.shape[1], dtype=torch.int64, device=y.device),
+                    nonfinite=torch.zeros(y.shape[1], dtype=torch.int64, device=y.device),
+                    max=torch.zeros(y.shape[1], device=y.device),
+                    top_v=torch.empty(0, device=y.device),
+                    top_idx=torch.empty(0, 3, dtype=torch.int64, device=y.device),
+                    x_max=torch.zeros((), device=y.device),
+                )
+            s["gt2"] += (y > 2).sum(0)
+            s["nonfinite"] += (~finite).sum(0)
+            s["max"] = torch.maximum(s["max"], y.amax(0))
+            x = inputs[0] if inputs and torch.is_tensor(inputs[0]) else None
+            if x is not None and x.numel():
+                xa = x.detach().float().abs()
+                s["x_max"] = torch.maximum(s["x_max"], torch.where(torch.isfinite(xa), xa, 0).amax())
+            k = min(16, y.numel())
+            v, flat = y.flatten().topk(k)
+            idx = torch.stack(
+                [torch.full_like(flat, s["calls"]), flat // y.shape[1] + 0, flat % y.shape[1]], 1
+            )
+            v = torch.cat([s["top_v"], v])
+            idx = torch.cat([s["top_idx"], idx])
+            keep = v.topk(min(16, v.numel())).indices
+            s["top_v"], s["top_idx"] = v[keep], idx[keep]
+            s["rows"] += y.shape[0]
+            s["calls"] += 1
+
+        return hook
+
+    for i, (_name, m) in enumerate(linears):
+        handles.append(m.register_forward_hook(make_hook(i)))
+    try:
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+        out = {}
+        for i, s in stats.items():
+            out[f"rows_{i}"] = np.array(s["rows"])
+            out[f"calls_{i}"] = np.array(s["calls"])
+            for key in ("gt2", "nonfinite", "max", "top_v", "top_idx", "x_max"):
+                out[f"{key}_{i}"] = s[key].cpu().numpy()
+        np.savez(directory / f"layers-{step:06d}.npz", **out)
+
+
+@contextmanager
 def inference_window(seed: int, model_t0_us: int, device, model=None):
     """Synchronize and bracket only the model call, excluding model loading.
 
@@ -109,9 +185,10 @@ def inference_window(seed: int, model_t0_us: int, device, model=None):
     if mode is None:
         yield None
         return
-    if mode not in {"clean", "observe", "bitflip", "profile", "values"}:
+    if mode not in {"clean", "observe", "bitflip", "profile", "values", "operands", "layers"}:
         raise ValueError(
-            "ALPASIM_FI_MODE must be clean, observe, bitflip, profile, or values"
+            "ALPASIM_FI_MODE must be clean, observe, bitflip, profile, values, "
+            "operands, or layers"
         )
     if not _lock.acquire(blocking=False):
         raise RuntimeError("Fault injection requires serial inference")
@@ -119,7 +196,7 @@ def inference_window(seed: int, model_t0_us: int, device, model=None):
         directory = Path(os.environ["ALPASIM_FI_OUTPUT"])
         directory.mkdir(parents=True, exist_ok=True)
         tool = None
-        if mode != "clean":
+        if mode not in ("clean", "layers"):
             if os.environ.get("TD_MODE") != mode:
                 raise ValueError("TD_MODE and ALPASIM_FI_MODE must match")
             tool = ctypes.CDLL(None)
@@ -165,11 +242,15 @@ def inference_window(seed: int, model_t0_us: int, device, model=None):
             traced = {
                 int(x) for x in os.environ.get("ALPASIM_FI_TRACE", "").split(",") if x
             }
-            trace = (
-                _nonfinite_trace(model, directory / f"trace-{step:06d}.jsonl")
-                if model is not None and step in traced
-                else contextlib.nullcontext()
-            )
+            layer_steps = {
+                int(x) for x in os.environ.get("ALPASIM_FI_LAYER_STEPS", "").split(",") if x
+            }
+            if model is not None and step in traced:
+                trace = _nonfinite_trace(model, directory / f"trace-{step:06d}.jsonl")
+            elif mode == "layers" and model is not None and step in layer_steps:
+                trace = _layer_profile(model, directory, step)
+            else:
+                trace = contextlib.nullcontext()
             try:
                 with trace:
                     yield record
