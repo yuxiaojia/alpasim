@@ -61,6 +61,8 @@ def inject(model, directory: Path, step: int, parts_table):
       scale:   y * ALPASIM_FI_SCALE (default 1000) for |y| > ALPASIM_FI_ABS_GT (default 2)
       window:  one exponent-bit flip into exponents ALPASIM_FI_EXPS (default 142,143)
       replace: sign(y) * U[lo, hi) from ALPASIM_FI_REPLACE (default 1024-130000), any y
+      clamp:   every |y| > ALPASIM_FI_ABS_GT (default 2) becomes sign(y) * ALPASIM_FI_CLAMP_TO
+               (default 1.9); set ALPASIM_FI_P=1 to clamp all of them
     ALPASIM_FI_P: probability per qualifying output element
     ALPASIM_FI_BOUNDCHECK=1: apply BoundCheck to the hooked layers' outputs after the fault
     ALPASIM_FI_TORCH_SEED (default 1): faults are a function of seed, decision, call.
@@ -69,8 +71,9 @@ def inject(model, directory: Path, step: int, parts_table):
     """
     parts = {_PART_IDS[x] for x in os.environ.get("ALPASIM_FI_PARTS", "vision,language,action").split(",") if x}
     fault = os.environ.get("ALPASIM_FI_MODEL", "scale")
-    if fault not in ("scale", "window", "replace"):
-        raise ValueError("ALPASIM_FI_MODEL must be scale, window or replace")
+    if fault not in ("scale", "window", "replace", "clamp"):
+        raise ValueError("ALPASIM_FI_MODEL must be scale, window, replace or clamp")
+    clamp_to = float(os.environ.get("ALPASIM_FI_CLAMP_TO", "1.9"))
     p = float(os.environ.get("ALPASIM_FI_P", "0"))
     scale = float(os.environ.get("ALPASIM_FI_SCALE", "1000"))
     abs_gt = float(os.environ.get("ALPASIM_FI_ABS_GT", "2"))
@@ -96,7 +99,7 @@ def inject(model, directory: Path, step: int, parts_table):
             call = totals["calls"]
             totals["calls"] += 1
             y = output.detach().float()
-            if fault == "scale":
+            if fault in ("scale", "clamp"):
                 qual = torch.isfinite(y) & (y.abs() > abs_gt)
             elif fault == "window":
                 flipped, qual = _bitflip_into(y.contiguous(), exps)
@@ -104,7 +107,8 @@ def inject(model, directory: Path, step: int, parts_table):
                 qual = torch.isfinite(y)
             gen = torch.Generator(device=y.device)
             gen.manual_seed((seed * 1000003 + step) * 1000003 + call)
-            pick = qual & (torch.rand(y.shape, generator=gen, device=y.device) < p)
+            pick = qual if p >= 1 else qual & (
+                torch.rand(y.shape, generator=gen, device=y.device, dtype=torch.float64) < p)
             nq = int(qual.sum())
             n = int(pick.sum())
             totals["outputs"] += y.numel()
@@ -113,6 +117,8 @@ def inject(model, directory: Path, step: int, parts_table):
                 return None
             if fault == "scale":
                 new = y * scale
+            elif fault == "clamp":
+                new = torch.sign(y) * clamp_to
             elif fault == "window":
                 new = flipped
             else:
