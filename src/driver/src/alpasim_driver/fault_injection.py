@@ -30,6 +30,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import torch_fault_injection
+
 _lock = threading.Lock()
 _step = 0
 
@@ -99,6 +101,38 @@ def _nonfinite_trace(model, path: Path):
             for handle in handles:
                 handle.remove()
             log.write(json.dumps(dict(total_module_calls=calls)) + "\n")
+
+
+# Model parts reported to an injector that exports td_set_part (alpasim_multi.so with
+# TD_WINDOW_PARTS): 1 vision encoder, 2 language model (reasoning), 3 action expert.
+_PARTS = (
+    ("vlm.model.visual", 1),
+    ("vlm.model.language_model", 2),
+    ("vlm.lm_head", 2),
+    ("expert", 3),
+    ("action_in_proj", 3),
+    ("action_out_proj", 3),
+)
+
+
+@contextmanager
+def _part_hooks(model, tool):
+    """Tell the injector which model part is issuing kernels (pre hook: the part,
+    post hook: 0). Kernel launches happen on the calling thread, so the part is
+    current when the injector sees each launch."""
+    handles = []
+    for name, part in _PARTS:
+        try:
+            module = model.get_submodule(name)
+        except AttributeError:
+            continue
+        handles.append(module.register_forward_pre_hook(lambda m, a, p=part: tool.td_set_part(p)))
+        handles.append(module.register_forward_hook(lambda m, a, o: tool.td_set_part(0)))
+    try:
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 @contextmanager
@@ -185,10 +219,11 @@ def inference_window(seed: int, model_t0_us: int, device, model=None):
     if mode is None:
         yield None
         return
-    if mode not in {"clean", "observe", "bitflip", "profile", "values", "operands", "layers"}:
+    if mode not in {"clean", "observe", "bitflip", "profile", "values", "operands", "layers",
+                    "torchfi"}:
         raise ValueError(
             "ALPASIM_FI_MODE must be clean, observe, bitflip, profile, values, "
-            "operands, or layers"
+            "operands, layers, or torchfi"
         )
     if not _lock.acquire(blocking=False):
         raise RuntimeError("Fault injection requires serial inference")
@@ -196,7 +231,7 @@ def inference_window(seed: int, model_t0_us: int, device, model=None):
         directory = Path(os.environ["ALPASIM_FI_OUTPUT"])
         directory.mkdir(parents=True, exist_ok=True)
         tool = None
-        if mode not in ("clean", "layers"):
+        if mode not in ("clean", "layers", "torchfi"):
             if os.environ.get("TD_MODE") != mode:
                 raise ValueError("TD_MODE and ALPASIM_FI_MODE must match")
             tool = ctypes.CDLL(None)
@@ -245,14 +280,21 @@ def inference_window(seed: int, model_t0_us: int, device, model=None):
             layer_steps = {
                 int(x) for x in os.environ.get("ALPASIM_FI_LAYER_STEPS", "").split(",") if x
             }
+            parts = contextlib.nullcontext()
+            if tool is not None and model is not None and hasattr(tool, "td_set_part"):
+                tool.td_set_part.argtypes = [ctypes.c_int]
+                tool.td_set_part.restype = None
+                parts = _part_hooks(model, tool)
             if model is not None and step in traced:
                 trace = _nonfinite_trace(model, directory / f"trace-{step:06d}.jsonl")
             elif mode == "layers" and model is not None and step in layer_steps:
                 trace = _layer_profile(model, directory, step)
+            elif mode == "torchfi" and model is not None and torch_fault_injection.selected(step):
+                trace = torch_fault_injection.inject(model, directory, step, _PARTS)
             else:
                 trace = contextlib.nullcontext()
             try:
-                with trace:
+                with trace, parts:
                     yield record
                 torch.cuda.synchronize(device)
                 if tool is not None:
