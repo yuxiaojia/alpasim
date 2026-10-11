@@ -66,6 +66,9 @@ def inject(model, directory: Path, step: int, parts_table):
     ALPASIM_FI_P: probability per qualifying output element
     ALPASIM_FI_BOUNDCHECK=1: apply BoundCheck to the hooked layers' outputs after the fault
     ALPASIM_FI_TORCH_SEED (default 1): faults are a function of seed, decision, call.
+    ALPASIM_FI_LOG_CALLS (default 200): layer calls per decision listed in detail; the
+    summary line always has the full counts (a clamp of every |y| > 2 logged every call,
+    about 80 MB per decision).
     Writes torchfi-<decision>.jsonl: one line per layer call with faults (up to 64 of
     them listed: flat index, before, after) and a summary line.
     """
@@ -81,6 +84,7 @@ def inject(model, directory: Path, step: int, parts_table):
     lo, hi = (float(x) for x in os.environ.get("ALPASIM_FI_REPLACE", "1024-130000").split("-"))
     boundcheck = os.environ.get("ALPASIM_FI_BOUNDCHECK", "0") == "1"
     seed = int(os.environ.get("ALPASIM_FI_TORCH_SEED", "1"))
+    log_calls = int(os.environ.get("ALPASIM_FI_LOG_CALLS", "200"))
     targets = []
     for name, module in model.named_modules():
         if not isinstance(module, torch.nn.Linear):
@@ -88,7 +92,7 @@ def inject(model, directory: Path, step: int, parts_table):
         part = next((pid for prefix, pid in parts_table if name.startswith(prefix)), 0)
         if part in parts:
             targets.append((name, part, module))
-    totals = dict(calls=0, outputs=0, qualifying=0, faults=0, flagged=0)
+    totals = dict(calls=0, outputs=0, qualifying=0, faults=0, flagged=0, logged_calls=0)
     handles = []
     log = (directory / f"torchfi-{step:06d}.jsonl").open("x")
 
@@ -130,7 +134,8 @@ def inject(model, directory: Path, step: int, parts_table):
                 out, flag = _boundcheck(out.contiguous())
                 totals["flagged"] += int(flag.sum())
             totals["faults"] += n
-            if n:
+            if n and totals["logged_calls"] < log_calls:
+                totals["logged_calls"] += 1
                 idx = pick.flatten().nonzero().flatten()[:64]
                 log.write(json.dumps(dict(
                     layer=name, part=part, call=call, faults=n, qualifying=nq,
