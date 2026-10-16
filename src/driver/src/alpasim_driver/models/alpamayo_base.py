@@ -18,7 +18,7 @@ from alpasim_grpc.v0.egodriver_pb2 import Route
 from alpasim_utils.geometry import Pose, Trajectory
 from scipy.interpolate import interp1d
 
-from ..fault_injection import inference_window
+from ..fault_injection import inference_window, shadow_enabled
 from ..schema import ModelConfig
 from .base import (
     BaseTrajectoryModel,
@@ -692,7 +692,12 @@ class AlpamayoBaseModel(BaseTrajectoryModel):
         # Move to device
         model_inputs = self._helper.to_device(model_inputs, self._device)
 
+        # The model pops entries from the dicts it is given; shadow mode needs the inputs twice.
+        def copy_inputs():
+            return {k: (dict(v) if hasattr(v, "keys") else v) for k, v in model_inputs.items()}
+
         # Run inference with autocast
+        shadow = shadow_enabled()
         with torch.no_grad():
             with torch.autocast(str(self._device.type), dtype=self.DTYPE):
                 with inference_window(
@@ -702,8 +707,18 @@ class AlpamayoBaseModel(BaseTrajectoryModel):
                     self._model,
                 ) as fault_record:
                     pred_xyz, pred_rot, extra = self._run_inference(
-                        model_inputs, nav_text
+                        copy_inputs() if shadow else model_inputs, nav_text
                     )
+                if shadow:
+                    with inference_window(
+                        prediction_input.inference_seed,
+                        latest_timestamp,
+                        self._device,
+                        self._model,
+                    ) as shadow_record:
+                        shadow_xyz, shadow_rot, _ = self._run_inference(
+                            copy_inputs(), nav_text
+                        )
 
         # Sampled candidates in the rig frame at t0, shapes
         # [batch=1, num_traj_sets=1, K, T, ...] -> (K, T, ...).
@@ -727,6 +742,21 @@ class AlpamayoBaseModel(BaseTrajectoryModel):
         if fault_record is not None:
             fault_record.save_prediction(
                 candidate_positions, candidate_rotations, select_ix
+            )
+        if shadow:
+            shadow_positions = shadow_xyz[0, 0].float().cpu().numpy()
+            shadow_record.save_prediction(
+                shadow_positions,
+                shadow_rot[0, 0].float().cpu().numpy(),
+                select_trajectory(
+                    candidate_positions=shadow_positions,
+                    candidate_timestamps_us=waypoint_timestamps_us,
+                    previous_plan_in_local=prediction_input.previous_plan,
+                    pose_local_to_rig_t0=pose_local_to_rig_t0,
+                    strategy=self._selection_strategy,
+                    max_num_distance_points=self._max_num_distance_points,
+                    skip_first_n_distance_points=self._skip_first_n_distance_points,
+                ),
             )
 
         # Log the reasoning trace of the selected candidate if available.  Text

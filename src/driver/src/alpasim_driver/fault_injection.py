@@ -206,6 +206,13 @@ def _layer_profile(model, directory: Path, step: int):
         np.savez(directory / f"layers-{step:06d}.npz", **out)
 
 
+def shadow_enabled() -> bool:
+    """ALPASIM_FI_SHADOW=1: every decision runs a clean inference that drives the car
+    (step 2k-1) and a second inference on the same inputs (step 2k) whose prediction is
+    only recorded, so injected faults at even steps never change the drive."""
+    return os.environ.get("ALPASIM_FI_MODE") is not None and os.environ.get("ALPASIM_FI_SHADOW") == "1"
+
+
 @contextmanager
 def inference_window(seed: int, model_t0_us: int, device, model=None):
     """Synchronize and bracket only the model call, excluding model loading.
@@ -248,8 +255,11 @@ def inference_window(seed: int, model_t0_us: int, device, model=None):
         step = _step
         # ONESHOT runtime sessions otherwise choose fresh random driver seeds.
         # Override only inside explicitly enabled experiments, before the model call.
+        # Shadow mode runs two inferences per decision (steps 2k-1 and 2k); both get the
+        # seed of decision k so they differ only by the injected faults.
         if "ALPASIM_FI_SEED" in os.environ:
-            seed = int(os.environ["ALPASIM_FI_SEED"]) + step - 1
+            index = (step + 1) // 2 if shadow_enabled() else step
+            seed = int(os.environ["ALPASIM_FI_SEED"]) + index - 1
             torch.manual_seed(seed)
             torch.cuda.manual_seed_all(seed)
         record = InferenceRecord(directory, step)
