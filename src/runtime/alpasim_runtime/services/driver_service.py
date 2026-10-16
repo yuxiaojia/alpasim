@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import random
 from typing import Type
 
@@ -115,7 +116,10 @@ class DriverService(ServiceBase[EgodriverServiceStub]):
             ),
         )
 
-        await session_info.broadcaster.broadcast(LogEntry(driver_camera_image=request))
+        # ALPASIM_LOG_CAMERA_IMAGES=0 keeps camera frames out of the rollout log (they are most
+        # of its size); the driver still receives every frame below.
+        if os.environ.get("ALPASIM_LOG_CAMERA_IMAGES", "1") != "0":
+            await session_info.broadcaster.broadcast(LogEntry(driver_camera_image=request))
 
         if self.skip:
             return
