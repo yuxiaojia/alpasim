@@ -18,6 +18,7 @@ import torch.serialization
 from vam.action_expert import VideoActionModelInference
 from vam.datalib.transforms import NeuroNCAPTransform
 
+from ..fault_injection import inference_window
 from ..schema import ModelConfig
 from .base import BaseTrajectoryModel, DriveCommand, ModelPrediction, PredictionInput
 
@@ -246,29 +247,37 @@ class VAMModel(BaseTrajectoryModel):
                 all_images.append(img)
             all_commands.append(self._encode_command(inp.command))
 
-        # --- Batch tokenize: (B*T, C, H, W) -> (B*T, h, w) ---
-        all_tokens = self._tokenize_frames(all_images)
-
-        # Reshape to (B, T, h, w)
-        token_h, token_w = all_tokens.shape[1], all_tokens.shape[2]
-        batched_tokens = all_tokens.reshape(
-            batch_size, self._context_length, token_h, token_w
-        )
-
-        # --- Batch commands: (B, 1) ---
-        batched_commands = torch.tensor(
-            all_commands, device=self._device, dtype=torch.long
-        ).unsqueeze(1)
-
-        # --- Single VAM forward pass ---
         autocast_ctx = (
             torch.amp.autocast(self._device.type, dtype=self.DTYPE)
             if self._use_autocast
             else nullcontext()
         )
-        with torch.no_grad():
-            with autocast_ctx:
-                trajectories = self._vam(batched_tokens, batched_commands, self.DTYPE)
+        # Fault-injection window (no-op unless ALPASIM_FI_MODE is set): image tokenizer and VAM forward,
+        # one window per call, as alpamayo_base brackets its whole inference.
+        with inference_window(
+            prediction_inputs[0].inference_seed,
+            frames[-1][0],  # (timestamp_us, image)
+            self._device,
+            self._vam,
+        ):
+            # --- Batch tokenize: (B*T, C, H, W) -> (B*T, h, w) ---
+            all_tokens = self._tokenize_frames(all_images)
+
+            # Reshape to (B, T, h, w)
+            token_h, token_w = all_tokens.shape[1], all_tokens.shape[2]
+            batched_tokens = all_tokens.reshape(
+                batch_size, self._context_length, token_h, token_w
+            )
+
+            # --- Batch commands: (B, 1) ---
+            batched_commands = torch.tensor(
+                all_commands, device=self._device, dtype=torch.long
+            ).unsqueeze(1)
+
+            # --- Single VAM forward pass ---
+            with torch.no_grad():
+                with autocast_ctx:
+                    trajectories = self._vam(batched_tokens, batched_commands, self.DTYPE)
 
         # --- Unpack per-sample results ---
         results: list[ModelPrediction] = []
