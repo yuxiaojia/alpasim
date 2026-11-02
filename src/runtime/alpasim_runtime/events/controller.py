@@ -126,20 +126,52 @@ class ControllerEvent(RecurringEvent):
         )
         rig_reference_trajectory = planner_delay_buffer.at(step_start_us)
 
-        propagated_states = await controller.run_controller_and_vehicle(
-            now_us=step_start_us,
-            pose_local_to_rig=pose_local_to_rig,
-            rig_linear_velocity_in_rig=rig_linear_velocity_in_rig,
-            rig_angular_velocity_in_rig=rig_angular_velocity_in_rig,
-            rig_linear_acceleration_in_rig=rig_linear_acceleration_in_rig,
-            rig_reference_trajectory_in_rig=rig_reference_trajectory,
-            future_us=target_time_us,
-            force_gt=force_gt,
-            coerce_dynamic_state=coerce_dynamic_state,
-            fallback_trajectory_local_to_rig=fallback_trajectory_local_to_rig,
-            pose_reporting_interval_us=state.unbound.pose_reporting_interval_us
-            or state.unbound.control_timestep_us,
-        )
+        # A planner delay that is not a multiple of the control step makes a plan
+        # ready in the middle of a step: switch to it there (one controller call per
+        # segment) instead of at the next step start, so the delay is exact.
+        delay_us = planner_delay_buffer.delay_us
+        switches = []
+        if delay_us > 0 and not force_gt:
+            switches = sorted(
+                ts + delay_us
+                for ts, _ in planner_delay_buffer.queue
+                if step_start_us < ts + delay_us < target_time_us
+            )
+        if not switches:
+            propagated_states = await controller.run_controller_and_vehicle(
+                now_us=step_start_us,
+                pose_local_to_rig=pose_local_to_rig,
+                rig_linear_velocity_in_rig=rig_linear_velocity_in_rig,
+                rig_angular_velocity_in_rig=rig_angular_velocity_in_rig,
+                rig_linear_acceleration_in_rig=rig_linear_acceleration_in_rig,
+                rig_reference_trajectory_in_rig=rig_reference_trajectory,
+                future_us=target_time_us,
+                force_gt=force_gt,
+                coerce_dynamic_state=coerce_dynamic_state,
+                fallback_trajectory_local_to_rig=fallback_trajectory_local_to_rig,
+                pose_reporting_interval_us=state.unbound.pose_reporting_interval_us
+                or state.unbound.control_timestep_us,
+            )
+        else:
+            propagated_states = []
+            bounds = [step_start_us, *switches, target_time_us]
+            for seg_start, seg_end in zip(bounds[:-1], bounds[1:]):
+                propagated_states += await controller.run_controller_and_vehicle(
+                    now_us=seg_start,
+                    pose_local_to_rig=pose_local_to_rig,
+                    rig_linear_velocity_in_rig=rig_linear_velocity_in_rig,
+                    rig_angular_velocity_in_rig=rig_angular_velocity_in_rig,
+                    rig_linear_acceleration_in_rig=rig_linear_acceleration_in_rig,
+                    rig_reference_trajectory_in_rig=planner_delay_buffer.at(seg_start),
+                    future_us=seg_end,
+                    force_gt=force_gt,
+                    coerce_dynamic_state=coerce_dynamic_state and seg_start == step_start_us,
+                    fallback_trajectory_local_to_rig=fallback_trajectory_local_to_rig,
+                    pose_reporting_interval_us=seg_end - seg_start,
+                )
+                # the controller keeps its own dynamic state between calls; only the
+                # pose has to match its last timestamp
+                pose_local_to_rig = propagated_states[-1].pose_local_to_rig
 
         # Convert list[PropagatedPosesAtTime] → two DynamicTrajectory instances.
         timestamps = np.array(
